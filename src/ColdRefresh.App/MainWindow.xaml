@@ -1,0 +1,15 @@
+<Window
+    x:Class="ColdRefresh.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="ColdRefresh">
+    <StackPanel Spacing="12" Padding="24">
+        <TextBlock Text="ColdRefresh" Style="{StaticResource TitleTextBlockStyle}" />
+        <InfoBar IsOpen="True" IsClosable="False" Severity="Warning"
+                 Title="Foundation build"
+                 Message="Production scanning and refresh are disabled until recovery validation is complete." />
+        <TextBlock Text="Safety first: no target data will be modified by this build." />
+        <Button Content="Scan (not yet enabled)" IsEnabled="False" HorizontalAlignment="Left" />
+        <Button Content="Refresh (not yet enabled)" IsEnabled="False" HorizontalAlignment="Left" />
+    </StackPanel>
+</Window>
