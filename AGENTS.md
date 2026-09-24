@@ -14,3 +14,5 @@ These rules apply to the entire repository and are non-negotiable.
 10. `Committed` requires durable `TargetVerified` evidence. Content that is merely known safe after an uncertain transaction is `AbortedSafe` and must not update `LastRefreshTime`.
 11. Publish `Committed`, `AbortedSafe`, or `RollbackSucceeded` only after restoring and read-back verifying every original `FILE_BASIC_INFO` field. A metadata failure remains non-terminal and recoverable.
 12. Skip read-only files in v1. Never clear and later restore `FILE_ATTRIBUTE_READONLY` as part of refresh.
+13. Once authoritative `TargetVerified` exists, later metadata or journal failures must preserve recovery state without another target content write.
+14. After restart, never overwrite mismatching target content automatically. The original lock is gone, so preserve the journal and require explicit manual recovery rather than overwriting possibly legitimate post-crash edits.

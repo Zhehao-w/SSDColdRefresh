@@ -19,6 +19,7 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
         var verify = ArrayPool<byte>.Shared.Rent(chunk.Length);
         JournalRecord? current = null;
         var targetWriteAttempted = false;
+        var targetContentVerified = false;
         try
         {
             var original = rented.AsMemory(0, chunk.Length);
@@ -61,6 +62,7 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
                 throw new InvalidDataException("Target read-back hash mismatch.");
             await _faults.AtAsync(FaultPoint.AfterTargetVerification);
             current = await PublishAsync(current, TransactionState.TargetVerified);
+            targetContentVerified = true;
             await RestoreAndVerifyMetadataAsync(chunk);
             current = await PublishAsync(current, TransactionState.Committed);
             return new(TransactionOutcome.Committed);
@@ -77,9 +79,11 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
         }
         catch (Exception ex)
         {
-            return targetWriteAttempted
-                ? await RollbackAsync(chunk, current!, rented.AsMemory(0, chunk.Length), verify.AsMemory(0, chunk.Length), ex)
-                : await AbortSafelyAsync(chunk, current!, verify.AsMemory(0, chunk.Length), TransactionOutcome.AbortedSafe, ex);
+            if (targetContentVerified)
+                return await PreserveVerifiedContentForRecoveryAsync(current!, ex);
+            if (targetWriteAttempted)
+                return await RollbackAsync(chunk, current!, rented.AsMemory(0, chunk.Length), verify.AsMemory(0, chunk.Length), ex);
+            return await AbortSafelyAsync(chunk, current!, verify.AsMemory(0, chunk.Length), TransactionOutcome.AbortedSafe, ex);
         }
         finally
         {
@@ -88,6 +92,12 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
             ArrayPool<byte>.Shared.Return(rented);
             ArrayPool<byte>.Shared.Return(verify);
         }
+    }
+
+    private async ValueTask<TransactionResult> PreserveVerifiedContentForRecoveryAsync(JournalRecord current, Exception cause)
+    {
+        try { await journal.PreserveForRecoveryAsync(current, cause); } catch { /* Never risk a content rewrite after TargetVerified. */ }
+        return new(TransactionOutcome.RecoveryRequired, cause);
     }
 
     private async ValueTask<JournalRecord> PublishAsync(JournalRecord current, TransactionState state)

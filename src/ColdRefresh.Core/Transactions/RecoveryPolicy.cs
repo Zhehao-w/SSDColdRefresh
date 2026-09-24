@@ -5,7 +5,6 @@ public enum RecoveryAction
     NoAction,
     RestoreMetadataThenCommit,
     RestoreMetadataThenMarkAbortedSafeWithoutContentWrite,
-    RestoreContentAndMetadataThenMarkAbortedSafe,
     BlockForManualRecovery
 }
 
@@ -18,11 +17,8 @@ public static class RecoveryPolicy
             => RecoveryAction.NoAction,
         TransactionState.RecoveryRequired => RecoveryAction.BlockForManualRecovery,
         TransactionState.TargetVerified when targetMatchesOriginalHash => RecoveryAction.RestoreMetadataThenCommit,
-        TransactionState.TargetVerified => RecoveryAction.RestoreContentAndMetadataThenMarkAbortedSafe,
         TransactionState.Prepared or TransactionState.TargetWritten or TransactionState.RollbackRequired
             when targetMatchesOriginalHash => RecoveryAction.RestoreMetadataThenMarkAbortedSafeWithoutContentWrite,
-        TransactionState.Prepared or TransactionState.TargetWritten or TransactionState.RollbackRequired
-            => RecoveryAction.RestoreContentAndMetadataThenMarkAbortedSafe,
         _ => RecoveryAction.BlockForManualRecovery
     };
 }

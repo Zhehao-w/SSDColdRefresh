@@ -12,10 +12,12 @@
 8. `Committed` requires durable `TargetVerified` evidence followed by verified metadata restoration. Merely matching original content can proceed toward `AbortedSafe` only after metadata verification; it never proves refresh success or permits a `LastRefreshTime` update.
 9. `RecoveryRequired` is never automatically downgraded based on content equality. It blocks for manual recovery in v1 because unresolved obligations can extend beyond content bytes.
 10. Every transition consumes the latest authoritative record returned by the preceding publication. Any safety-critical anomaly stops the session; it never advances to another file.
+11. Once authoritative `TargetVerified` exists, later metadata or journal failures preserve the latest state and never rewrite target content.
+12. Startup recovery never overwrites mismatching content automatically. Without the original lock, a mismatch may be a legitimate post-crash edit; v1 preserves the journal and blocks for manual recovery.
 
 ## Protected failure classes
 
-The design protects against process termination, many power-loss/BSOD points, torn header updates, partial target writes, hash mismatches, and rename/path-reuse races through a bounded recovery slot, two independently checksummed headers, flush/read-back verification, identity-based reopening, and rollback. Startup reads and hashes the target first, avoiding recovery writes when content already matches. Protection depends on at least one valid header and readable, matching journal payload.
+The design protects against process termination, many power-loss/BSOD points, torn header updates, partial target writes, hash mismatches, and rename/path-reuse races through a bounded recovery slot, two independently checksummed headers, flush/read-back verification, identity-based reopening, and in-process rollback. Automatic rollback is limited to the live transaction while its original protected handle remains open. Startup only reconciles matching content; mismatching content is preserved unchanged because its provenance is ambiguous. Protection depends on at least one valid header and readable, matching journal payload.
 
 Separate-disk storage is recommended because loss of the target device is less likely to also destroy recovery bytes. Same-physical-disk storage is permitted with a persistent warning but cannot protect against device-wide failure, controller failure, firmware corruption, or loss of that SSD. Drive-letter difference is irrelevant; `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` must compare every backing physical disk extent. Spanned/shared extents require conservative rejection unless disjointness is proven.
 

@@ -39,6 +39,14 @@ public sealed class IdentityAndRecoveryPolicyTests
         Assert.Equal(RecoveryAction.RestoreMetadataThenMarkAbortedSafeWithoutContentWrite, RecoveryPolicy.Decide(state, targetMatchesOriginalHash: true));
 
     [Theory]
+    [InlineData(TransactionState.Prepared)]
+    [InlineData(TransactionState.TargetWritten)]
+    [InlineData(TransactionState.TargetVerified)]
+    [InlineData(TransactionState.RollbackRequired)]
+    public void Mismatching_content_after_restart_always_blocks_manual_recovery(TransactionState state) =>
+        Assert.Equal(RecoveryAction.BlockForManualRecovery, RecoveryPolicy.Decide(state, targetMatchesOriginalHash: false));
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public void Recovery_required_always_blocks_for_manual_recovery(bool targetMatchesOriginalHash) =>

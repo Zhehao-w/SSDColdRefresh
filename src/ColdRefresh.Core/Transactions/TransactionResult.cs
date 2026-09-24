@@ -12,6 +12,6 @@ public enum TransactionOutcome
 
 public sealed record TransactionResult(TransactionOutcome Outcome, Exception? Error = null)
 {
-    public bool TargetVerified => Outcome == TransactionOutcome.Committed;
+    public bool RefreshSuccessfullyCompleted => Outcome == TransactionOutcome.Committed;
     public bool SessionMustStop => Outcome is not TransactionOutcome.Committed;
 }

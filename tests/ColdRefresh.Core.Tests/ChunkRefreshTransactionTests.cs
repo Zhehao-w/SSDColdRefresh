@@ -129,7 +129,7 @@ public sealed class ChunkRefreshTransactionTests
         var result = await fixture.ExecuteAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(TransactionOutcome.RollbackSucceeded, result.Outcome);
-        Assert.False(result.TargetVerified);
+        Assert.False(result.RefreshSuccessfullyCompleted);
         Assert.Equal(Original, fixture.Target.Bytes);
         Assert.Equal(TransactionState.RollbackSucceeded, fixture.Journal.Authoritative!.State);
     }
@@ -155,9 +155,25 @@ public sealed class ChunkRefreshTransactionTests
 
         Assert.Equal(TransactionOutcome.RecoveryRequired, result.Outcome);
         Assert.True(fixture.Journal.Preserved);
+        Assert.Equal(1, fixture.Target.WriteCount);
+        Assert.Equal(TransactionState.TargetVerified, fixture.Journal.Authoritative!.State);
         Assert.DoesNotContain(TransactionState.Committed, fixture.Journal.States);
         Assert.DoesNotContain(TransactionState.AbortedSafe, fixture.Journal.States);
         Assert.DoesNotContain(TransactionState.RollbackSucceeded, fixture.Journal.States);
+    }
+
+    [Fact]
+    public async Task Final_publication_failure_after_target_verified_never_rewrites_content()
+    {
+        var fixture = new Fixture { FailPublicationForState = TransactionState.Committed };
+
+        var result = await fixture.ExecuteAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(TransactionOutcome.RecoveryRequired, result.Outcome);
+        Assert.True(fixture.Journal.Preserved);
+        Assert.Equal(1, fixture.Target.WriteCount);
+        Assert.Equal(TransactionState.TargetVerified, fixture.Journal.Authoritative!.State);
+        Assert.DoesNotContain(TransactionState.Committed, fixture.Journal.States);
     }
 
     [Fact]
@@ -245,6 +261,7 @@ public sealed class ChunkRefreshTransactionTests
         public bool FailFirstWrite { set => Target.FailFirstWrite = value; }
         public bool FailWritesAfterFirst { set => Target.FailWritesAfterFirst = value; }
         public bool FailMetadataRestore { set => Target.FailMetadataRestore = value; }
+        public TransactionState FailPublicationForState { set => Journal.FailPublicationForState = value; }
         public (CancellationStage Stage, CancellationTokenSource Source) Cancellation
         {
             set { Target.Cancellation = value; Journal.Cancellation = value; }
@@ -321,6 +338,7 @@ public sealed class ChunkRefreshTransactionTests
         public bool CorruptReadback { get; set; }
         public bool Preserved { get; private set; }
         public Func<bool>? TerminalPublicationGuard { get; set; }
+        public TransactionState? FailPublicationForState { get; set; }
         public (CancellationStage Stage, CancellationTokenSource Source)? Cancellation { get; set; }
 
         public ValueTask WritePayloadAsync(ChunkDescriptor chunk, ReadOnlyMemory<byte> original, CancellationToken cancellationToken)
@@ -353,6 +371,8 @@ public sealed class ChunkRefreshTransactionTests
 
         public ValueTask<JournalRecord> PublishStateAsync(JournalRecord supplied, TransactionState next)
         {
+            if (next == FailPublicationForState)
+                throw new IOException($"Injected {next} publication failure.");
             if ((next is TransactionState.Committed or TransactionState.AbortedSafe or TransactionState.RollbackSucceeded) &&
                 TerminalPublicationGuard?.Invoke() != true)
                 throw new InvalidOperationException("Terminal state requires verified metadata restoration.");
