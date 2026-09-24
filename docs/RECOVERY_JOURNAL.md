@@ -60,6 +60,10 @@ While holding the same locked target handle, capture identity, expected size, an
 
 Before `Prepared` becomes authoritative, the previous terminal header remains authoritative even though its old payload may have been overwritten. A crash/torn header at this point leaves no new recovery obligation. New `Prepared` is permitted only with no existing authority or after `Empty`, `Committed`, `AbortedSafe`, or `RollbackSucceeded`; it is rejected after `Prepared`, `TargetWritten`, `TargetVerified`, `RollbackRequired`, or `RecoveryRequired`. Sequence wraparound is rejected. No intermediate `Empty` publication is required.
 
+This permission check occurs in the journal **before payload preparation**, not only in `PublishPrepared`. `WritePayload` may mutate the slot only with no authority or `Committed`, `AbortedSafe`, or `RollbackSucceeded`. With `Prepared`, `TargetWritten`, `TargetVerified`, `RollbackRequired`, or `RecoveryRequired`, it rejects before copying bytes, changing active length/pending chunk metadata, truncating, preallocating, or otherwise affecting active recovery data. A terminal authority at `SequenceNumber == ulong.MaxValue` also rejects before payload mutation because no successor can be published. Checking only at `PublishPrepared` is too late: the authoritative transaction's sole recovery copy would already be lost.
+
+Pending payload bytes written under no/terminal authority are not themselves a durable recovery obligation and may be replaced or retried until `Prepared` becomes authoritative. The lifecycle is: no/terminal authority means mutable slot; authoritative `Prepared` through unresolved states means protected slot; `Committed`, `AbortedSafe`, or `RollbackSucceeded` makes it mutable again.
+
 ## Header updates and authoritative records
 
 Never update an active header in place. Copy every immutable transaction field, increment sequence by exactly one without wrapping, change state, compute the header hash, write the inactive header, flush, read back, and validate. The valid header with greatest sequence is authoritative. Equal-sequence headers must be byte-identical or recovery is ambiguous and blocked.

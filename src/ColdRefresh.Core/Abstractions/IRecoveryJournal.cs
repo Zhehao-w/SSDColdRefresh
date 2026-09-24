@@ -4,6 +4,11 @@ namespace ColdRefresh.Core.Abstractions;
 
 public interface IRecoveryJournal
 {
+    /// <summary>
+    /// Replaces the reusable payload only when no valid authority exists or the authority is a resolved terminal
+    /// state. Implementations must reject unresolved authority (and sequence exhaustion) before changing any
+    /// payload byte, payload length, pending descriptor, allocation, or other active recovery data.
+    /// </summary>
     ValueTask WritePayloadAsync(ChunkDescriptor chunk, ReadOnlyMemory<byte> original, CancellationToken cancellationToken);
     ValueTask FlushAsync(CancellationToken cancellationToken);
     ValueTask ReadPayloadExactlyAsync(ChunkDescriptor chunk, Memory<byte> destination, CancellationToken cancellationToken);

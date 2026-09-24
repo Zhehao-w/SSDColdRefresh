@@ -29,6 +29,7 @@ The universal rule is: stop modifying data when uncertain. Benign eligibility sk
 | Crash while reusing payload before new `Prepared` | The previous terminal header remains authoritative. Ignore payload mismatch against that terminal header; the unpublished transaction created no recovery obligation. |
 | Attempt to prepare over non-terminal authority | Reject and block new work. Reconcile the unresolved transaction first; never replace its identity, hashes, metadata, or sequence. |
 | Journal sequence exhaustion | Fail closed before publication. Never wrap or reset the journal-global sequence. |
+| Payload write attempted with unresolved authority | The journal rejects before the first mutation. Preserve the authoritative header, payload bytes, active length, pending descriptor, and payload hash so the old transaction remains fully recoverable. |
 
 Automatic filesystem/disk repair is forbidden. A successful rollback still marks the drive/session suspect.
 

@@ -115,19 +115,54 @@ public sealed class ChunkRefreshTransactionTests
         Assert.True(fixture.Journal.IsAuthoritativePayloadValidForStartup());
     }
 
-    [Fact]
-    public async Task New_prepared_cannot_supersede_unresolved_transaction()
+    [Theory]
+    [InlineData(TransactionState.Prepared)]
+    [InlineData(TransactionState.TargetWritten)]
+    [InlineData(TransactionState.TargetVerified)]
+    [InlineData(TransactionState.RollbackRequired)]
+    [InlineData(TransactionState.RecoveryRequired)]
+    public async Task Unresolved_authority_rejects_payload_replacement_before_any_mutation(TransactionState unresolvedState)
     {
         var fixture = new Fixture();
-        await fixture.Journal.PrepareForTestAsync(fixture.Descriptor, Original, TestContext.Current.CancellationToken);
+        var current = await fixture.Journal.PrepareForTestAsync(fixture.Descriptor, Original, TestContext.Current.CancellationToken);
+        current = await fixture.Journal.MoveToUnresolvedStateForTestAsync(current, unresolvedState);
+        var authoritativeBefore = fixture.Journal.Authoritative;
+        var payloadBefore = fixture.Journal.GetPayloadSnapshot();
+        var payloadLengthBefore = fixture.Journal.AuthoritativePayloadLength;
+        var payloadHashBefore = System.Security.Cryptography.SHA256.HashData(payloadBefore);
         var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
         var nextBytes = Original.Reverse().ToArray();
-        await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken);
-        var hash = System.Security.Cryptography.SHA256.HashData(nextBytes);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await fixture.Journal.PublishPreparedAsync(nextChunk, hash, hash));
-        Assert.Equal(TransactionState.Prepared, fixture.Journal.Authoritative!.State);
+            await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken));
+
+        Assert.Equal(authoritativeBefore, fixture.Journal.Authoritative);
+        Assert.Equal(current.SequenceNumber, fixture.Journal.Authoritative!.SequenceNumber);
+        Assert.Equal(payloadLengthBefore, fixture.Journal.AuthoritativePayloadLength);
+        Assert.Equal(payloadBefore, fixture.Journal.GetPayloadSnapshot());
+        Assert.Equal(payloadHashBefore, System.Security.Cryptography.SHA256.HashData(fixture.Journal.GetPayloadSnapshot()));
+        Assert.True(fixture.Journal.DoesPayloadMatchAuthoritativeHash());
+        Assert.Equal(unresolvedState != TransactionState.RecoveryRequired, fixture.Journal.IsAuthoritativePayloadValidForStartup());
+    }
+
+    [Fact]
+    public async Task Coordinator_stops_before_target_write_when_journal_payload_is_protected()
+    {
+        var fixture = new Fixture();
+        var oldPrepared = await fixture.Journal.PrepareForTestAsync(
+            fixture.Descriptor,
+            Original,
+            TestContext.Current.CancellationToken);
+        var payloadBefore = fixture.Journal.GetPayloadSnapshot();
+        var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
+
+        var result = await fixture.ExecuteAsync(nextChunk, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TransactionOutcome.FailedBeforeTargetWrite, result.Outcome);
+        Assert.Equal(0, fixture.Target.WriteCount);
+        Assert.Equal(oldPrepared, fixture.Journal.Authoritative);
+        Assert.Equal(payloadBefore, fixture.Journal.GetPayloadSnapshot());
+        Assert.True(fixture.Journal.DoesPayloadMatchAuthoritativeHash());
     }
 
     [Theory]
@@ -144,12 +179,31 @@ public sealed class ChunkRefreshTransactionTests
         var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
         var nextBytes = Original.Reverse().ToArray();
         await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken);
-        var hash = System.Security.Cryptography.SHA256.HashData(nextBytes);
+        await fixture.Journal.FlushAsync(TestContext.Current.CancellationToken);
+        var readback = new byte[nextBytes.Length];
+        await fixture.Journal.ReadPayloadExactlyAsync(nextChunk, readback, TestContext.Current.CancellationToken);
+        var hash = System.Security.Cryptography.SHA256.HashData(readback);
 
         var prepared = await fixture.Journal.PublishPreparedAsync(nextChunk, hash, hash);
 
         Assert.Equal(current.SequenceNumber + 1, prepared.SequenceNumber);
         Assert.Equal(TransactionState.Prepared, prepared.State);
+    }
+
+    [Fact]
+    public async Task Sequence_exhaustion_rejects_payload_before_mutation()
+    {
+        var fixture = new Fixture();
+        await fixture.ExecuteAsync(TestContext.Current.CancellationToken);
+        fixture.Journal.SetAuthoritativeSequenceForTest(ulong.MaxValue);
+        var payloadBefore = fixture.Journal.GetPayloadSnapshot();
+        var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await fixture.Journal.WritePayloadAsync(nextChunk, Original.Reverse().ToArray(), TestContext.Current.CancellationToken));
+
+        Assert.Equal(payloadBefore, fixture.Journal.GetPayloadSnapshot());
+        Assert.Equal(ulong.MaxValue, fixture.Journal.Authoritative!.SequenceNumber);
     }
 
     [Fact]
@@ -472,6 +526,11 @@ public sealed class ChunkRefreshTransactionTests
 
         public ValueTask WritePayloadAsync(ChunkDescriptor chunk, ReadOnlyMemory<byte> original, CancellationToken cancellationToken)
         {
+            if (Authoritative is not null && Authoritative.State is not
+                (TransactionState.Empty or TransactionState.Committed or TransactionState.AbortedSafe or TransactionState.RollbackSucceeded))
+                throw new InvalidOperationException("Unresolved authority protects the active recovery payload.");
+            if (Authoritative?.SequenceNumber == ulong.MaxValue)
+                throw new InvalidOperationException("Journal sequence exhausted before payload replacement.");
             if (Cancellation?.Stage == CancellationStage.JournalWrite) Cancellation.Value.Source.Cancel();
             cancellationToken.ThrowIfCancellationRequested();
             if (chunk.Length > _slot.Length || original.Length != chunk.Length) throw new ArgumentOutOfRangeException(nameof(chunk));
@@ -580,7 +639,48 @@ public sealed class ChunkRefreshTransactionTests
             return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(hash, Authoritative.JournalDataHash);
         }
 
+        public bool DoesPayloadMatchAuthoritativeHash()
+        {
+            if (Authoritative is null || AuthoritativePayloadLength != Authoritative.Chunk.Length) return false;
+            var hash = System.Security.Cryptography.SHA256.HashData(_slot.AsSpan(0, Authoritative.Chunk.Length));
+            return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(hash, Authoritative.JournalDataHash);
+        }
+
         public void CorruptPayloadForTest() => _slot[0] ^= 0xff;
+
+        public void SetAuthoritativeSequenceForTest(ulong sequence) =>
+            Authoritative = Authoritative is null
+                ? throw new InvalidOperationException("Authority required.")
+                : Authoritative with { SequenceNumber = sequence };
+
+        public byte[] GetPayloadSnapshot() => _slot.AsSpan(0, AuthoritativePayloadLength).ToArray();
+
+        public async ValueTask<JournalRecord> MoveToUnresolvedStateForTestAsync(JournalRecord current, TransactionState state)
+        {
+            if (state == TransactionState.Prepared) return current;
+            if (state == TransactionState.TargetWritten)
+                return await PublishStateAsync(current, TransactionState.TargetWritten);
+            if (state == TransactionState.TargetVerified)
+            {
+                current = await PublishStateAsync(current, TransactionState.TargetWritten);
+                return await PublishStateAsync(current, TransactionState.TargetVerified);
+            }
+            if (state == TransactionState.RollbackRequired)
+                return await PublishStateAsync(current, TransactionState.RollbackRequired);
+            if (state == TransactionState.RecoveryRequired)
+            {
+                var recoveryRequired = current with
+                {
+                    SequenceNumber = current.SequenceNumber + 1,
+                    State = TransactionState.RecoveryRequired
+                };
+                Authoritative = recoveryRequired;
+                States.Add(TransactionState.RecoveryRequired);
+                Sequences.Add(recoveryRequired.SequenceNumber);
+                return recoveryRequired;
+            }
+            throw new ArgumentOutOfRangeException(nameof(state));
+        }
 
         public ValueTask PreserveForRecoveryAsync(JournalRecord record, Exception cause)
         {

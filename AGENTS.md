@@ -17,3 +17,4 @@ These rules apply to the entire repository and are non-negotiable.
 13. Once authoritative `TargetVerified` exists, later metadata or journal failures must preserve recovery state without another target content write.
 14. After restart, never overwrite mismatching target content automatically. The original lock is gone, so preserve the journal and require explicit manual recovery rather than overwriting possibly legitimate post-crash edits.
 15. Journal sequence numbers are global across slot reuse and never reset per chunk. A terminal authority remains durable while the next payload is prepared, and no new `Prepared` may supersede unresolved work.
+16. An unresolved authoritative transaction protects both its header and recovery payload. Reject a new transaction before any payload byte, length, pending descriptor, or allocation can be changed; checking only at `Prepared` publication is too late.

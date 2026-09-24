@@ -28,6 +28,8 @@ Runtime rollback and startup reconciliation are intentionally different. While t
 
 The fixed journal slot is reusable across chunks. Sequence numbers belong to the journal, increase globally across transactions, and never restart at zero. Core asks the journal to publish a new `Prepared`; it never invents the prior sequence. A new transaction is allowed only after no authority or `Empty`, `Committed`, `AbortedSafe`, or `RollbackSucceeded`. The previous terminal header stays authoritative while the next payload is written/flushed/verified, so a crash before the new `Prepared` creates no recovery obligation.
 
+Slot mutability is enforced inside the journal, not merely by its callers. With no authority or terminal authority the payload may be replaced/retried. As soon as `Prepared` is authoritative, the payload is protected until a safe terminal state. An attempted write under `Prepared`, `TargetWritten`, `TargetVerified`, `RollbackRequired`, or `RecoveryRequired` is rejected before changing bytes, length, pending descriptor, or allocation. Checking only when publishing the next header is too late because it would destroy the current recovery copy.
+
 ## Deferred work
 
 Binary journal I/O, real `SafeFileHandle` adapters, device extent discovery, NTFS screening, metadata restoration, startup recovery, sleep inhibition, full-file hashing, and SQLite history are intentionally deferred. No placeholder claims production safety.

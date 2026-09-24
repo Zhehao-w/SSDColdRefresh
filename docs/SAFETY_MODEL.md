@@ -16,6 +16,7 @@
 12. Startup recovery never overwrites mismatching content automatically. Without the original lock, a mismatch may be a legitimate post-crash edit; v1 preserves the journal and blocks for manual recovery.
 13. Sequence numbers are journal-global across slot reuse, never per-chunk counters. Only the journal chooses the next sequence and it fails closed on wraparound.
 14. A previous terminal header remains authoritative while a future payload is prepared. Terminal headers do not make payload bytes recovery-authoritative, and unresolved non-terminal authority can never be superseded by a new transaction.
+15. An unresolved authoritative transaction protects both its header and payload. The journal rejects replacement before any payload byte, length, pending descriptor, truncation, preallocation, or other active recovery data can change; a later `Prepared` rejection cannot repair overwritten recovery bytes.
 
 ## Protected failure classes
 
