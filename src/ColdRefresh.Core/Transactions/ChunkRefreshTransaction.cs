@@ -37,9 +37,13 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
             if (!CryptographicOperations.FixedTimeEquals(sourceHash, journalHash))
                 throw new InvalidDataException("Recovery journal read-back hash mismatch.");
 
-            var candidate = new JournalRecord(0, TransactionState.Empty, chunk, sourceHash, journalHash);
-            current = await journal.PublishStateAsync(candidate, TransactionState.Prepared);
-            if (current.State != TransactionState.Prepared || current.SequenceNumber != candidate.SequenceNumber + 1 || !current.HasValidHashes)
+            current = await journal.PublishPreparedAsync(chunk, sourceHash, journalHash);
+            if (current.State != TransactionState.Prepared ||
+                current.SequenceNumber == 0 ||
+                current.Chunk != chunk ||
+                !CryptographicOperations.FixedTimeEquals(current.OriginalChunkHash, sourceHash) ||
+                !CryptographicOperations.FixedTimeEquals(current.JournalDataHash, journalHash) ||
+                !current.HasValidHashes)
                 throw new InvalidDataException("Journal did not publish a verified PREPARED record.");
             await _faults.AtAsync(FaultPoint.AfterPrepared);
 

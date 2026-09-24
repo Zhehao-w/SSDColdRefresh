@@ -24,13 +24,140 @@ public sealed class ChunkRefreshTransactionTests
     }
 
     [Fact]
+    public async Task Logical_refresh_over_128MiB_uses_three_transactions_without_sequence_reset()
+    {
+        var fixture = new Fixture();
+        var secondChunk = fixture.Descriptor with { SessionId = Guid.Parse("10213243-5465-7687-98a9-bacbdcedfe0f") };
+        var thirdChunk = fixture.Descriptor with { SessionId = Guid.Parse("20314253-6475-8697-a8b9-cadbecfd0e1f") };
+        var logicalFileSize = (2L * RefreshOptions.DefaultChunkSize) + 1;
+        var plannedChunkCount = (logicalFileSize + RefreshOptions.DefaultChunkSize - 1) / RefreshOptions.DefaultChunkSize;
+
+        var first = await fixture.ExecuteAsync(fixture.Descriptor, TestContext.Current.CancellationToken);
+        var second = await fixture.ExecuteAsync(secondChunk, TestContext.Current.CancellationToken);
+        var third = await fixture.ExecuteAsync(thirdChunk, TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, plannedChunkCount);
+        Assert.Equal(TransactionOutcome.Committed, first.Outcome);
+        Assert.Equal(TransactionOutcome.Committed, second.Outcome);
+        Assert.Equal(TransactionOutcome.Committed, third.Outcome);
+        Assert.Equal(
+            [
+                TransactionState.Prepared, TransactionState.TargetWritten, TransactionState.TargetVerified, TransactionState.Committed,
+                TransactionState.Prepared, TransactionState.TargetWritten, TransactionState.TargetVerified, TransactionState.Committed,
+                TransactionState.Prepared, TransactionState.TargetWritten, TransactionState.TargetVerified, TransactionState.Committed
+            ],
+            fixture.Journal.States);
+        Assert.Equal([1UL, 2UL, 3UL, 4UL, 5UL, 6UL, 7UL, 8UL, 9UL, 10UL, 11UL, 12UL], fixture.Journal.Sequences);
+    }
+
+    [Fact]
+    public async Task Reused_payload_before_prepared_does_not_invalidate_terminal_authority()
+    {
+        var fixture = new Fixture();
+        await fixture.ExecuteAsync(TestContext.Current.CancellationToken);
+        var committed = fixture.Journal.Authoritative;
+        var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
+        var nextBytes = Original.Reverse().ToArray();
+
+        await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken);
+        await fixture.Journal.FlushAsync(TestContext.Current.CancellationToken);
+        var readback = new byte[nextBytes.Length];
+        await fixture.Journal.ReadPayloadExactlyAsync(nextChunk, readback, TestContext.Current.CancellationToken);
+        Assert.Equal(nextBytes, readback);
+
+        Assert.Equal(committed, fixture.Journal.Authoritative);
+        Assert.Equal(TransactionState.Committed, fixture.Journal.Authoritative!.State);
+        Assert.True(fixture.Journal.IsAuthoritativePayloadValidForStartup());
+        Assert.Equal(RecoveryAction.NoAction, RecoveryPolicy.Decide(TransactionState.Committed, targetMatchesOriginalHash: false));
+    }
+
+    [Fact]
+    public async Task Published_prepared_makes_reused_payload_authoritative()
+    {
+        var fixture = new Fixture();
+        await fixture.ExecuteAsync(TestContext.Current.CancellationToken);
+        var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
+        var nextBytes = Original.Reverse().ToArray();
+        await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken);
+        await fixture.Journal.FlushAsync(TestContext.Current.CancellationToken);
+        var readback = new byte[nextBytes.Length];
+        await fixture.Journal.ReadPayloadExactlyAsync(nextChunk, readback, TestContext.Current.CancellationToken);
+        var hash = System.Security.Cryptography.SHA256.HashData(readback);
+
+        var prepared = await fixture.Journal.PublishPreparedAsync(nextChunk, hash, hash);
+
+        Assert.Equal(TransactionState.Prepared, prepared.State);
+        Assert.Equal(5UL, prepared.SequenceNumber);
+        Assert.True(fixture.Journal.IsAuthoritativePayloadValidForStartup());
+        fixture.Journal.CorruptPayloadForTest();
+        Assert.False(fixture.Journal.IsAuthoritativePayloadValidForStartup());
+    }
+
+    [Fact]
+    public async Task Torn_prepared_keeps_previous_terminal_authority_and_ignores_new_payload()
+    {
+        var fixture = new Fixture();
+        await fixture.ExecuteAsync(TestContext.Current.CancellationToken);
+        var committed = fixture.Journal.Authoritative;
+        var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
+        var nextBytes = Original.Reverse().ToArray();
+        await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken);
+        await fixture.Journal.FlushAsync(TestContext.Current.CancellationToken);
+        var readback = new byte[nextBytes.Length];
+        await fixture.Journal.ReadPayloadExactlyAsync(nextChunk, readback, TestContext.Current.CancellationToken);
+        var hash = System.Security.Cryptography.SHA256.HashData(readback);
+        fixture.Journal.TearNextPreparedPublication = true;
+
+        await Assert.ThrowsAsync<IOException>(async () =>
+            await fixture.Journal.PublishPreparedAsync(nextChunk, hash, hash));
+
+        Assert.Equal(committed, fixture.Journal.Authoritative);
+        Assert.True(fixture.Journal.IsAuthoritativePayloadValidForStartup());
+    }
+
+    [Fact]
+    public async Task New_prepared_cannot_supersede_unresolved_transaction()
+    {
+        var fixture = new Fixture();
+        await fixture.Journal.PrepareForTestAsync(fixture.Descriptor, Original, TestContext.Current.CancellationToken);
+        var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
+        var nextBytes = Original.Reverse().ToArray();
+        await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken);
+        var hash = System.Security.Cryptography.SHA256.HashData(nextBytes);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await fixture.Journal.PublishPreparedAsync(nextChunk, hash, hash));
+        Assert.Equal(TransactionState.Prepared, fixture.Journal.Authoritative!.State);
+    }
+
+    [Theory]
+    [InlineData(TransactionState.AbortedSafe)]
+    [InlineData(TransactionState.RollbackSucceeded)]
+    public async Task New_prepared_can_follow_resolved_non_success_terminal(TransactionState terminal)
+    {
+        var fixture = new Fixture();
+        fixture.Journal.TerminalPublicationGuard = () => true;
+        var current = await fixture.Journal.PrepareForTestAsync(fixture.Descriptor, Original, TestContext.Current.CancellationToken);
+        if (terminal == TransactionState.RollbackSucceeded)
+            current = await fixture.Journal.PublishStateAsync(current, TransactionState.RollbackRequired);
+        current = await fixture.Journal.PublishStateAsync(current, terminal);
+        var nextChunk = fixture.Descriptor with { SessionId = Guid.NewGuid() };
+        var nextBytes = Original.Reverse().ToArray();
+        await fixture.Journal.WritePayloadAsync(nextChunk, nextBytes, TestContext.Current.CancellationToken);
+        var hash = System.Security.Cryptography.SHA256.HashData(nextBytes);
+
+        var prepared = await fixture.Journal.PublishPreparedAsync(nextChunk, hash, hash);
+
+        Assert.Equal(current.SequenceNumber + 1, prepared.SequenceNumber);
+        Assert.Equal(TransactionState.Prepared, prepared.State);
+    }
+
+    [Fact]
     public async Task Strict_journal_rejects_stale_record()
     {
         var fixture = new Fixture();
         var descriptor = fixture.Descriptor;
-        var hash = System.Security.Cryptography.SHA256.HashData(Original);
-        var initial = new JournalRecord(0, TransactionState.Empty, descriptor, hash, hash);
-        var prepared = await fixture.Journal.PublishStateAsync(initial, TransactionState.Prepared);
+        var prepared = await fixture.Journal.PrepareForTestAsync(descriptor, Original, TestContext.Current.CancellationToken);
         var written = await fixture.Journal.PublishStateAsync(prepared, TransactionState.TargetWritten);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
@@ -42,9 +169,7 @@ public sealed class ChunkRefreshTransactionTests
     public async Task Strict_journal_rejects_commit_from_target_written()
     {
         var fixture = new Fixture();
-        var hash = System.Security.Cryptography.SHA256.HashData(Original);
-        var initial = new JournalRecord(0, TransactionState.Empty, fixture.Descriptor, hash, hash);
-        var prepared = await fixture.Journal.PublishStateAsync(initial, TransactionState.Prepared);
+        var prepared = await fixture.Journal.PrepareForTestAsync(fixture.Descriptor, Original, TestContext.Current.CancellationToken);
         var written = await fixture.Journal.PublishStateAsync(prepared, TransactionState.TargetWritten);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
@@ -275,6 +400,8 @@ public sealed class ChunkRefreshTransactionTests
         }
         public ValueTask<TransactionResult> ExecuteAsync(CancellationToken token) =>
             new ChunkRefreshTransaction(Target, Journal, _faults).ExecuteAsync(Descriptor, token);
+        public ValueTask<TransactionResult> ExecuteAsync(ChunkDescriptor descriptor, CancellationToken token) =>
+            new ChunkRefreshTransaction(Target, Journal, _faults).ExecuteAsync(descriptor, token);
 
         public static ChunkDescriptor CreateDescriptor(int length) => new(
             Guid.Parse("00112233-4455-6677-8899-aabbccddeeff"),
@@ -331,6 +458,7 @@ public sealed class ChunkRefreshTransactionTests
     private sealed class StrictMemoryJournal(int capacity) : IRecoveryJournal
     {
         private readonly byte[] _slot = new byte[capacity];
+        private ChunkDescriptor? _pendingChunk;
         public JournalRecord? Authoritative { get; private set; }
         public List<TransactionState> States { get; } = [];
         public List<ulong> Sequences { get; } = [];
@@ -339,6 +467,7 @@ public sealed class ChunkRefreshTransactionTests
         public bool Preserved { get; private set; }
         public Func<bool>? TerminalPublicationGuard { get; set; }
         public TransactionState? FailPublicationForState { get; set; }
+        public bool TearNextPreparedPublication { get; set; }
         public (CancellationStage Stage, CancellationTokenSource Source)? Cancellation { get; set; }
 
         public ValueTask WritePayloadAsync(ChunkDescriptor chunk, ReadOnlyMemory<byte> original, CancellationToken cancellationToken)
@@ -348,6 +477,7 @@ public sealed class ChunkRefreshTransactionTests
             if (chunk.Length > _slot.Length || original.Length != chunk.Length) throw new ArgumentOutOfRangeException(nameof(chunk));
             original.CopyTo(_slot);
             AuthoritativePayloadLength = chunk.Length;
+            _pendingChunk = chunk;
             return ValueTask.CompletedTask;
         }
 
@@ -376,12 +506,7 @@ public sealed class ChunkRefreshTransactionTests
             if ((next is TransactionState.Committed or TransactionState.AbortedSafe or TransactionState.RollbackSucceeded) &&
                 TerminalPublicationGuard?.Invoke() != true)
                 throw new InvalidOperationException("Terminal state requires verified metadata restoration.");
-            if (Authoritative is null)
-            {
-                if (supplied.SequenceNumber != 0 || supplied.State != TransactionState.Empty || next != TransactionState.Prepared)
-                    throw new InvalidOperationException("Initial publication must be Empty(0) -> Prepared(1).");
-            }
-            else if (supplied != Authoritative)
+            if (Authoritative is null || supplied != Authoritative)
             {
                 throw new InvalidOperationException("Caller supplied a stale or non-authoritative record.");
             }
@@ -394,6 +519,69 @@ public sealed class ChunkRefreshTransactionTests
             return ValueTask.FromResult(published);
         }
 
+        public ValueTask<JournalRecord> PublishPreparedAsync(
+            ChunkDescriptor chunk,
+            ReadOnlyMemory<byte> originalChunkHash,
+            ReadOnlyMemory<byte> journalDataHash)
+        {
+            if (TearNextPreparedPublication)
+            {
+                TearNextPreparedPublication = false;
+                throw new IOException("Injected torn Prepared header.");
+            }
+            if (Authoritative is not null && Authoritative.State is not
+                (TransactionState.Empty or TransactionState.Committed or TransactionState.AbortedSafe or TransactionState.RollbackSucceeded))
+                throw new InvalidOperationException("A new transaction cannot supersede unresolved authority.");
+            if (_pendingChunk != chunk || AuthoritativePayloadLength != chunk.Length)
+                throw new InvalidOperationException("Prepared must reference the verified pending payload.");
+            var actualHash = System.Security.Cryptography.SHA256.HashData(_slot.AsSpan(0, chunk.Length));
+            if (!System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(actualHash, originalChunkHash.Span) ||
+                !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(actualHash, journalDataHash.Span))
+                throw new InvalidDataException("Prepared hashes do not match the pending payload.");
+            if (Authoritative?.SequenceNumber == ulong.MaxValue)
+                throw new InvalidOperationException("Journal sequence exhausted.");
+
+            var nextSequence = Authoritative is null ? 1UL : Authoritative.SequenceNumber + 1;
+            var prepared = new JournalRecord(
+                nextSequence,
+                TransactionState.Prepared,
+                chunk,
+                originalChunkHash.ToArray(),
+                journalDataHash.ToArray());
+            Authoritative = prepared;
+            States.Add(TransactionState.Prepared);
+            Sequences.Add(nextSequence);
+            return ValueTask.FromResult(prepared);
+        }
+
+        public async ValueTask<JournalRecord> PrepareForTestAsync(
+            ChunkDescriptor chunk,
+            ReadOnlyMemory<byte> bytes,
+            CancellationToken cancellationToken)
+        {
+            await WritePayloadAsync(chunk, bytes, cancellationToken);
+            await FlushAsync(cancellationToken);
+            var readback = new byte[chunk.Length];
+            await ReadPayloadExactlyAsync(chunk, readback, cancellationToken);
+            var hash = System.Security.Cryptography.SHA256.HashData(readback);
+            return await PublishPreparedAsync(chunk, hash, hash);
+        }
+
+        public bool IsAuthoritativePayloadValidForStartup()
+        {
+            if (Authoritative is null || Authoritative.State is
+                TransactionState.Empty or TransactionState.Committed or TransactionState.AbortedSafe or TransactionState.RollbackSucceeded)
+                return true;
+            if (Authoritative.State == TransactionState.RecoveryRequired)
+                return false;
+            if (AuthoritativePayloadLength != Authoritative.Chunk.Length)
+                return false;
+            var hash = System.Security.Cryptography.SHA256.HashData(_slot.AsSpan(0, Authoritative.Chunk.Length));
+            return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(hash, Authoritative.JournalDataHash);
+        }
+
+        public void CorruptPayloadForTest() => _slot[0] ^= 0xff;
+
         public ValueTask PreserveForRecoveryAsync(JournalRecord record, Exception cause)
         {
             if (Authoritative is not null && record != Authoritative)
@@ -404,7 +592,6 @@ public sealed class ChunkRefreshTransactionTests
 
         private static bool IsLegalTransition(TransactionState current, TransactionState next) => (current, next) switch
         {
-            (TransactionState.Empty, TransactionState.Prepared) => true,
             (TransactionState.Prepared, TransactionState.TargetWritten or TransactionState.RollbackRequired or TransactionState.AbortedSafe) => true,
             (TransactionState.TargetWritten, TransactionState.TargetVerified or TransactionState.RollbackRequired) => true,
             (TransactionState.TargetVerified, TransactionState.Committed or TransactionState.RollbackRequired) => true,

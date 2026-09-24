@@ -14,7 +14,7 @@ All integers are unsigned little-endian except signed `FILETIME` values as noted
 
 The journal file size is exactly `8192 + PayloadCapacity`. `PayloadCapacity` is fixed when the journal is created (normally 64 MiB); creation preallocates or explicitly sets that complete file length. Reuse never truncates the file. Every valid active header requires `0 < ChunkLength <= PayloadCapacity` and `PayloadOffset == 8192`.
 
-Only payload bytes `[0, ChunkLength)` are authoritative for the active transaction and only those bytes are read or SHA-256 hashed. Bytes `[ChunkLength, PayloadCapacity)` are ignored and may contain stale bytes from a prior, longer chunk. They must never influence validation or recovery. This rule makes a short final chunk safe without clearing the unused slot tail.
+For a non-terminal active transaction, only payload bytes `[0, ChunkLength)` are authoritative and only those bytes are read or SHA-256 hashed. Bytes `[ChunkLength, PayloadCapacity)` are ignored and may contain stale bytes from a prior, longer chunk. For terminal authority (`Empty`, `Committed`, `AbortedSafe`, or `RollbackSucceeded`), no payload bytes are recovery-authoritative: the slot may already contain an unpublished next transaction. Startup must not compare terminal-header payload hashes. This rule makes both short final chunks and pre-publication slot reuse safe.
 
 ## Header fields
 
@@ -50,19 +50,21 @@ The four timestamp fields preserve the raw signed 64-bit Windows values without 
 
 `FILE_ID_128` is never parsed as a GUID and undergoes no byte swapping. Session IDs remain GUIDs, but are serialized explicitly as RFC 4122/network-order bytes: for `00112233-4455-6677-8899-aabbccddeeff`, header bytes are `00 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF`. Implementations must not use the default mixed-endian `Guid.ToByteArray()` representation.
 
-State codes are: 0 `Empty`, 1 `Prepared`, 2 `TargetWritten`, 3 `TargetVerified`, 4 `Committed`, 5 `RollbackRequired`, 6 `RollbackSucceeded`, 7 `RecoveryRequired`, 8 `AbortedSafe`. Unknown codes are invalid and fail closed. `(ChunkOffset + ChunkLength)` must not overflow and must be at most `OriginalFileSize`; capacity and journal file bounds must agree.
+State codes are: 0 `Empty`, 1 `Prepared`, 2 `TargetWritten`, 3 `TargetVerified`, 4 `Committed`, 5 `RollbackRequired`, 6 `RollbackSucceeded`, 7 `RecoveryRequired`, 8 `AbortedSafe`. Unknown codes are invalid and fail closed. `(ChunkOffset + ChunkLength)` must not overflow and must be at most `OriginalFileSize`; capacity and journal file bounds must agree. `Empty` is the logical state of a brand-new journal with no valid header; v1 does not publish an `Empty` header or insert `Empty` between transactions.
 
 `Committed` means durable evidence proves the target write was flushed and its read-back matched `OriginalChunkHash`, and original metadata was restored and verified. `AbortedSafe` means logical content and original metadata have been verified safe but completion of the refresh write is unproven; it is not refresh success and must never update `LastRefreshTime`. `RollbackSucceeded` likewise requires verified restored content and metadata.
 
 ## Creating `Prepared`
 
-While holding the same locked target handle, capture identity, expected size, and raw `FILE_BASIC_INFO`; read the complete target chunk; compute `OriginalChunkHash`; write exactly `ChunkLength` payload bytes; flush; read back exactly those bytes; compute `JournalDataHash`; and require both hashes equal. Then write a complete `Prepared` header with a sequence exactly one greater than the authoritative header into the inactive/lower-sequence slot, flush, read it back, validate all bounds and `HeaderHash`, and only then expose the returned authoritative record. A torn payload/header remains unusable.
+While holding the same locked target handle, capture identity, expected size, and raw `FILE_BASIC_INFO`; read the complete target chunk; compute `OriginalChunkHash`; write exactly `ChunkLength` payload bytes; flush; read back exactly those bytes; compute `JournalDataHash`; and require both hashes equal. Core then calls the dedicated `PublishPrepared` operation with the new immutable transaction fields and hashes. The journal—not Core—selects sequence 1 when no valid authority exists or the previous authoritative sequence plus one when reusing the slot. It writes the complete `Prepared` header into the inactive/lower-sequence slot, flushes, reads it back, validates bounds and `HeaderHash`, selects it as authority, and returns that exact record.
+
+Before `Prepared` becomes authoritative, the previous terminal header remains authoritative even though its old payload may have been overwritten. A crash/torn header at this point leaves no new recovery obligation. New `Prepared` is permitted only with no existing authority or after `Empty`, `Committed`, `AbortedSafe`, or `RollbackSucceeded`; it is rejected after `Prepared`, `TargetWritten`, `TargetVerified`, `RollbackRequired`, or `RecoveryRequired`. Sequence wraparound is rejected. No intermediate `Empty` publication is required.
 
 ## Header updates and authoritative records
 
 Never update an active header in place. Copy every immutable transaction field, increment sequence by exactly one without wrapping, change state, compute the header hash, write the inactive header, flush, read back, and validate. The valid header with greatest sequence is authoritative. Equal-sequence headers must be byte-identical or recovery is ambiguous and blocked.
 
-Every successful publication returns that newly authoritative `JournalRecord`. The caller must supply that exact record—matching both sequence and state—to the next publication. Stale callers and illegal transitions fail closed; a journal implementation must not silently repair their sequence. A committed/aborted slot is reused only by writing and verifying the next payload and then publishing a higher-sequence `Prepared` header.
+Every successful publication returns that newly authoritative `JournalRecord`. `PublishPrepared` owns journal-global sequence selection and may replace immutable transaction fields only from an allowed resolved state. Thereafter the caller must supply that exact record—matching sequence, state, and immutable fields—to each `PublishState` transition. Stale callers and illegal transitions fail closed. Sequence numbers increase across every transaction for the lifetime of the reused journal file and never reset per chunk.
 
 ## Runtime state and write-attempt boundary
 
@@ -79,7 +81,7 @@ No durable terminal state (`Committed`, `AbortedSafe`, or `RollbackSucceeded`) m
 Before new work, a recovery reader must:
 
 1. Validate both headers and select the unambiguous highest valid sequence.
-2. Validate bounds and hash exactly the first `ChunkLength` payload bytes.
+2. For `Prepared`, `TargetWritten`, `TargetVerified`, or `RollbackRequired`, validate bounds and hash exactly the first `ChunkLength` payload bytes. For a terminal header, ignore the payload. `RecoveryRequired` remains fail-closed and all available evidence is preserved rather than inferred from payload validity.
 3. Open/lock and validate volume serial, opaque file ID, and expected file size.
 4. Read the current target chunk before any recovery write.
 5. SHA-256 exactly the current `ChunkLength` target bytes.

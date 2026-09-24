@@ -14,6 +14,8 @@
 10. Every transition consumes the latest authoritative record returned by the preceding publication. Any safety-critical anomaly stops the session; it never advances to another file.
 11. Once authoritative `TargetVerified` exists, later metadata or journal failures preserve the latest state and never rewrite target content.
 12. Startup recovery never overwrites mismatching content automatically. Without the original lock, a mismatch may be a legitimate post-crash edit; v1 preserves the journal and blocks for manual recovery.
+13. Sequence numbers are journal-global across slot reuse, never per-chunk counters. Only the journal chooses the next sequence and it fails closed on wraparound.
+14. A previous terminal header remains authoritative while a future payload is prepared. Terminal headers do not make payload bytes recovery-authoritative, and unresolved non-terminal authority can never be superseded by a new transaction.
 
 ## Protected failure classes
 

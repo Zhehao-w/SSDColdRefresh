@@ -26,6 +26,9 @@ The universal rule is: stop modifying data when uncertain. Benign eligibility sk
 | Read-only file | Skip as unsupported. Never clear `FILE_ATTRIBUTE_READONLY` to force a refresh. |
 | Metadata or final publication failure after authoritative `TargetVerified` | Preserve the latest journal state and report recovery required. Do not roll back or otherwise rewrite already-verified target content. |
 | Startup target hash mismatch in any non-terminal state | Do not restore automatically. Preserve both target and journal and block for explicit operator recovery because the mismatch may be a legitimate edit made after the lock disappeared. |
+| Crash while reusing payload before new `Prepared` | The previous terminal header remains authoritative. Ignore payload mismatch against that terminal header; the unpublished transaction created no recovery obligation. |
+| Attempt to prepare over non-terminal authority | Reject and block new work. Reconcile the unresolved transaction first; never replace its identity, hashes, metadata, or sequence. |
+| Journal sequence exhaustion | Fail closed before publication. Never wrap or reset the journal-global sequence. |
 
 Automatic filesystem/disk repair is forbidden. A successful rollback still marks the drive/session suspect.
 

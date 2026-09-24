@@ -26,6 +26,8 @@ Startup must resolve the highest valid dual header before enabling Scan or Refre
 
 Runtime rollback and startup reconciliation are intentionally different. While the original process holds the same validated handle with write/delete sharing denied, a failed attempted write may be automatically rolled back from verified journal bytes. Once authoritative `TargetVerified` is published, content rollback is forbidden; later metadata or journal failures preserve that state without another content write. After restart no original lock exists, so reconciliation is read-only unless content already matches; a mismatch is ambiguous and must never be overwritten automatically.
 
+The fixed journal slot is reusable across chunks. Sequence numbers belong to the journal, increase globally across transactions, and never restart at zero. Core asks the journal to publish a new `Prepared`; it never invents the prior sequence. A new transaction is allowed only after no authority or `Empty`, `Committed`, `AbortedSafe`, or `RollbackSucceeded`. The previous terminal header stays authoritative while the next payload is written/flushed/verified, so a crash before the new `Prepared` creates no recovery obligation.
+
 ## Deferred work
 
 Binary journal I/O, real `SafeFileHandle` adapters, device extent discovery, NTFS screening, metadata restoration, startup recovery, sleep inhibition, full-file hashing, and SQLite history are intentionally deferred. No placeholder claims production safety.
