@@ -20,6 +20,7 @@ public sealed class ChunkRefreshTransactionTests
             [TransactionState.Prepared, TransactionState.TargetWritten, TransactionState.TargetVerified, TransactionState.Committed],
             fixture.Journal.States);
         Assert.Equal([1UL, 2UL, 3UL, 4UL], fixture.Journal.Sequences);
+        Assert.Equal(1, fixture.Target.MetadataRestoreCount);
     }
 
     [Fact]
@@ -146,6 +147,20 @@ public sealed class ChunkRefreshTransactionTests
     }
 
     [Fact]
+    public async Task Metadata_failure_cannot_publish_any_terminal_state()
+    {
+        var fixture = new Fixture { FailMetadataRestore = true };
+
+        var result = await fixture.ExecuteAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(TransactionOutcome.RecoveryRequired, result.Outcome);
+        Assert.True(fixture.Journal.Preserved);
+        Assert.DoesNotContain(TransactionState.Committed, fixture.Journal.States);
+        Assert.DoesNotContain(TransactionState.AbortedSafe, fixture.Journal.States);
+        Assert.DoesNotContain(TransactionState.RollbackSucceeded, fixture.Journal.States);
+    }
+
+    [Fact]
     public async Task Cancellation_before_source_read_is_safe()
     {
         using var cancellation = new CancellationTokenSource();
@@ -229,13 +244,18 @@ public sealed class ChunkRefreshTransactionTests
         public bool CorruptFirstTargetReadback { set => Target.CorruptReadbackOnce = value; }
         public bool FailFirstWrite { set => Target.FailFirstWrite = value; }
         public bool FailWritesAfterFirst { set => Target.FailWritesAfterFirst = value; }
+        public bool FailMetadataRestore { set => Target.FailMetadataRestore = value; }
         public (CancellationStage Stage, CancellationTokenSource Source) Cancellation
         {
             set { Target.Cancellation = value; Journal.Cancellation = value; }
         }
 
         public Fixture() : this(NoFaultInjector.Instance) { }
-        public Fixture(IFaultInjector faults) => _faults = faults;
+        public Fixture(IFaultInjector faults)
+        {
+            _faults = faults;
+            Journal.TerminalPublicationGuard = () => Target.MetadataVerified;
+        }
         public ValueTask<TransactionResult> ExecuteAsync(CancellationToken token) =>
             new ChunkRefreshTransaction(Target, Journal, _faults).ExecuteAsync(Descriptor, token);
 
@@ -256,6 +276,9 @@ public sealed class ChunkRefreshTransactionTests
         public bool CorruptReadbackOnce { get; set; }
         public bool FailFirstWrite { get; set; }
         public bool FailWritesAfterFirst { get; set; }
+        public bool FailMetadataRestore { get; set; }
+        public bool MetadataVerified { get; private set; }
+        public int MetadataRestoreCount { get; private set; }
         public (CancellationStage Stage, CancellationTokenSource Source)? Cancellation { get; set; }
 
         public ValueTask ReadExactlyAsync(ChunkDescriptor chunk, Memory<byte> destination, CancellationToken cancellationToken)
@@ -278,6 +301,14 @@ public sealed class ChunkRefreshTransactionTests
         }
 
         public ValueTask FlushAsync() => ValueTask.CompletedTask;
+
+        public ValueTask RestoreAndVerifyMetadataAsync(ChunkDescriptor chunk)
+        {
+            MetadataRestoreCount++;
+            if (FailMetadataRestore) throw new IOException("Injected metadata restoration failure.");
+            MetadataVerified = true;
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class StrictMemoryJournal(int capacity) : IRecoveryJournal
@@ -289,6 +320,7 @@ public sealed class ChunkRefreshTransactionTests
         public int AuthoritativePayloadLength { get; private set; }
         public bool CorruptReadback { get; set; }
         public bool Preserved { get; private set; }
+        public Func<bool>? TerminalPublicationGuard { get; set; }
         public (CancellationStage Stage, CancellationTokenSource Source)? Cancellation { get; set; }
 
         public ValueTask WritePayloadAsync(ChunkDescriptor chunk, ReadOnlyMemory<byte> original, CancellationToken cancellationToken)
@@ -321,6 +353,9 @@ public sealed class ChunkRefreshTransactionTests
 
         public ValueTask<JournalRecord> PublishStateAsync(JournalRecord supplied, TransactionState next)
         {
+            if ((next is TransactionState.Committed or TransactionState.AbortedSafe or TransactionState.RollbackSucceeded) &&
+                TerminalPublicationGuard?.Invoke() != true)
+                throw new InvalidOperationException("Terminal state requires verified metadata restoration.");
             if (Authoritative is null)
             {
                 if (supplied.SequenceNumber != 0 || supplied.State != TransactionState.Empty || next != TransactionState.Prepared)

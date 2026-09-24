@@ -35,15 +35,20 @@ public sealed class IdentityAndRecoveryPolicyTests
     [InlineData(TransactionState.Prepared)]
     [InlineData(TransactionState.TargetWritten)]
     [InlineData(TransactionState.RollbackRequired)]
-    [InlineData(TransactionState.RecoveryRequired)]
     public void Matching_content_in_incomplete_state_is_aborted_safe_without_write(TransactionState state) =>
-        Assert.Equal(RecoveryAction.MarkAbortedSafeWithoutWrite, RecoveryPolicy.Decide(state, targetMatchesOriginalHash: true));
+        Assert.Equal(RecoveryAction.RestoreMetadataThenMarkAbortedSafeWithoutContentWrite, RecoveryPolicy.Decide(state, targetMatchesOriginalHash: true));
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Recovery_required_always_blocks_for_manual_recovery(bool targetMatchesOriginalHash) =>
+        Assert.Equal(RecoveryAction.BlockForManualRecovery, RecoveryPolicy.Decide(TransactionState.RecoveryRequired, targetMatchesOriginalHash));
 
     [Fact]
     public void Target_written_alone_can_never_imply_refresh_success() =>
-        Assert.NotEqual(RecoveryAction.CommitVerified, RecoveryPolicy.Decide(TransactionState.TargetWritten, targetMatchesOriginalHash: true));
+        Assert.NotEqual(RecoveryAction.RestoreMetadataThenCommit, RecoveryPolicy.Decide(TransactionState.TargetWritten, targetMatchesOriginalHash: true));
 
     [Fact]
     public void Only_target_verified_evidence_can_reconcile_to_commit() =>
-        Assert.Equal(RecoveryAction.CommitVerified, RecoveryPolicy.Decide(TransactionState.TargetVerified, targetMatchesOriginalHash: true));
+        Assert.Equal(RecoveryAction.RestoreMetadataThenCommit, RecoveryPolicy.Decide(TransactionState.TargetVerified, targetMatchesOriginalHash: true));
 }

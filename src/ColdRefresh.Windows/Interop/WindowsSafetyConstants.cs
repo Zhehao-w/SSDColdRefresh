@@ -4,6 +4,7 @@ public static class WindowsSafetyConstants
 {
     public const uint IoctlVolumeGetVolumeDiskExtents = 0x00560000;
     public const FileAttributes UnsupportedAttributes =
+        FileAttributes.ReadOnly |
         FileAttributes.ReparsePoint |
         FileAttributes.SparseFile |
         FileAttributes.Compressed |

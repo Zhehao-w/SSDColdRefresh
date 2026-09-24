@@ -52,7 +52,7 @@ The four timestamp fields preserve the raw signed 64-bit Windows values without 
 
 State codes are: 0 `Empty`, 1 `Prepared`, 2 `TargetWritten`, 3 `TargetVerified`, 4 `Committed`, 5 `RollbackRequired`, 6 `RollbackSucceeded`, 7 `RecoveryRequired`, 8 `AbortedSafe`. Unknown codes are invalid and fail closed. `(ChunkOffset + ChunkLength)` must not overflow and must be at most `OriginalFileSize`; capacity and journal file bounds must agree.
 
-`Committed` means durable evidence proves the target write was flushed and its read-back matched `OriginalChunkHash`. `AbortedSafe` means logical content has been verified safe but completion of the refresh write is unproven; it is not refresh success and must never update `LastRefreshTime`.
+`Committed` means durable evidence proves the target write was flushed and its read-back matched `OriginalChunkHash`, and original metadata was restored and verified. `AbortedSafe` means logical content and original metadata have been verified safe but completion of the refresh write is unproven; it is not refresh success and must never update `LastRefreshTime`. `RollbackSucceeded` likewise requires verified restored content and metadata.
 
 ## Creating `Prepared`
 
@@ -68,9 +68,11 @@ Every successful publication returns that newly authoritative `JournalRecord`. T
 
 Normal: `Empty/Committed/AbortedSafe -> Prepared -> TargetWritten -> TargetVerified -> Committed`. Before invoking target write, the coordinator performs its final cancellation check and fault boundary. The in-memory `targetWriteAttempted` flag is set immediately before the write call, with no await or cancellation point between them.
 
-If an error or caller cancellation occurs after `Prepared` but before write attempt, read/hash the still-locked target. If it matches, publish `AbortedSafe` without writing target data. If it cannot be proven unchanged, retain the journal as `RecoveryRequired`. After write attempt, partial modification is assumed: publish `RollbackRequired`, restore only verified payload bytes, flush, read back, verify, and publish `RollbackSucceeded`; indeterminate rollback preserves recovery state.
+If an error or caller cancellation occurs after `Prepared` but before write attempt, read/hash the still-locked target. If it matches, restore and read-back verify original metadata, then publish `AbortedSafe` without writing target data. If either content or metadata cannot be proven restored, retain a non-terminal recovery state. After write attempt, partial modification is assumed: publish `RollbackRequired`, restore only verified payload bytes, flush, read back, verify, restore/read-back verify metadata, and only then publish `RollbackSucceeded`; indeterminate rollback preserves recovery state.
 
-`TargetWritten` records only that the write call returned and does not prove flush or verification. `TargetVerified` is published only after flush plus matching target read-back. Only an authoritative `TargetVerified` can transition to `Committed`.
+`TargetWritten` records only that the write call returned and does not prove flush or verification. `TargetVerified` is published only after flush plus matching target read-back; it proves content only, not metadata. From `TargetVerified`, restore and query back all original `FILE_BASIC_INFO` values before publishing `Committed`.
+
+No durable terminal state (`Committed`, `AbortedSafe`, or `RollbackSucceeded`) may bypass metadata restoration and verification. The universal ordering is: verify safe content; restore CreationTime, LastAccessTime, LastWriteTime, ChangeTime, and FileAttributes; query them through the same locked handle; compare all required values; then publish the terminal header. A crash before terminal publication leaves the prior non-terminal state authoritative and restart repeats reconciliation.
 
 ## Startup reconciliation: read before write
 
@@ -82,8 +84,8 @@ Before new work, a recovery reader must:
 4. Read the current target chunk before any recovery write.
 5. SHA-256 exactly the current `ChunkLength` target bytes.
 
-For `Prepared`, `TargetWritten`, `RollbackRequired`, or an automatically recoverable `RecoveryRequired`, matching target content causes **no target write** and transitions to `AbortedSafe`. If content differs, restore the verified payload, flush, read back, SHA-256 verify, restore the journaled `FILE_BASIC_INFO`, and then publish `AbortedSafe`. Content safety does not prove refresh completion.
+For `Prepared`, `TargetWritten`, or `RollbackRequired`, matching target content causes **no target content write**. Restore and read-back verify metadata, then publish `AbortedSafe`. If content differs, restore the verified payload, flush, read back, SHA-256 verify, restore/read-back verify the journaled `FILE_BASIC_INFO`, and then publish `AbortedSafe`. Content safety alone does not permit a terminal state.
 
-For `TargetVerified`, independently matching target content plus the durable state is sufficient to publish `Committed`; a mismatch restores verified original bytes and becomes `AbortedSafe`. `Committed`, `AbortedSafe`, `RollbackSucceeded`, and `Empty` require no content write. No matching identity, invalid metadata, or unverifiable payload means preserve the journal and block. SQLite is neither consulted nor trusted for recovery.
+For `TargetVerified`, independently matching target content plus the durable state permits metadata restoration/verification and only then `Committed`; a mismatch restores verified original bytes and metadata before `AbortedSafe`. `RecoveryRequired` always yields `BlockForManualRecovery` in v1, whether the target hash matches or differs: its unresolved obligation may be journal publication, rollback, metadata, identity, ambiguity, device, or recovery failure. `Committed`, `AbortedSafe`, `RollbackSucceeded`, and `Empty` require no content write when already authoritative. No matching identity, invalid metadata, or unverifiable payload means preserve the journal and block. SQLite is neither consulted nor trusted for recovery.
 
-The journal stores plaintext. Metadata restoration is complete only after `SetFileInformationByHandle` succeeds and subsequent inspection confirms the required values; failure stops recovery and retains diagnostics/journal state.
+The journal stores plaintext. Metadata restoration is complete only after `SetFileInformationByHandle` succeeds and subsequent inspection confirms all required values; failure stops recovery and retains a non-terminal journal state. Read-only files are unsupported in v1 and skipped before preparation; the implementation must not temporarily clear `FILE_ATTRIBUTE_READONLY`.

@@ -61,6 +61,7 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
                 throw new InvalidDataException("Target read-back hash mismatch.");
             await _faults.AtAsync(FaultPoint.AfterTargetVerification);
             current = await PublishAsync(current, TransactionState.TargetVerified);
+            await RestoreAndVerifyMetadataAsync(chunk);
             current = await PublishAsync(current, TransactionState.Committed);
             return new(TransactionOutcome.Committed);
         }
@@ -110,6 +111,7 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
             await target.ReadExactlyAsync(chunk, readback, CancellationToken.None);
             if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(readback.Span), current.OriginalChunkHash))
                 throw new InvalidDataException("Target changed before the write-attempt boundary.");
+            await RestoreAndVerifyMetadataAsync(chunk);
             current = await PublishAsync(current, TransactionState.AbortedSafe);
             return new(outcome, cause);
         }
@@ -143,6 +145,7 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
             await target.ReadExactlyAsync(chunk, readback, CancellationToken.None);
             if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(readback.Span), current.OriginalChunkHash))
                 throw new InvalidDataException("Rollback verification failed.");
+            await RestoreAndVerifyMetadataAsync(chunk);
             current = await PublishAsync(current, TransactionState.RollbackSucceeded);
             return new(TransactionOutcome.RollbackSucceeded, cause);
         }
@@ -152,5 +155,11 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
             try { await journal.PreserveForRecoveryAsync(current, combined); } catch { /* Never mask recovery-required. */ }
             return new(TransactionOutcome.RecoveryRequired, combined);
         }
+    }
+
+    private async ValueTask RestoreAndVerifyMetadataAsync(ChunkDescriptor chunk)
+    {
+        await _faults.AtAsync(FaultPoint.DuringMetadataRestore);
+        await target.RestoreAndVerifyMetadataAsync(chunk);
     }
 }

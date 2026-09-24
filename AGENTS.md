@@ -12,3 +12,5 @@ These rules apply to the entire repository and are non-negotiable.
 8. Production filesystem writes remain disabled until the journal implementation, startup recovery, identity locking, metadata preservation, and fault-injection tests have been reviewed.
 9. Treat `FILE_ID_128` as 16 opaque bytes, never as a GUID. Carry the exact authoritative journal record returned by each state publication into the next transition.
 10. `Committed` requires durable `TargetVerified` evidence. Content that is merely known safe after an uncertain transaction is `AbortedSafe` and must not update `LastRefreshTime`.
+11. Publish `Committed`, `AbortedSafe`, or `RollbackSucceeded` only after restoring and read-back verifying every original `FILE_BASIC_INFO` field. A metadata failure remains non-terminal and recoverable.
+12. Skip read-only files in v1. Never clear and later restore `FILE_ATTRIBUTE_READONLY` as part of refresh.

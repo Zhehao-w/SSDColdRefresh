@@ -3,9 +3,9 @@ namespace ColdRefresh.Core.Transactions;
 public enum RecoveryAction
 {
     NoAction,
-    CommitVerified,
-    MarkAbortedSafeWithoutWrite,
-    RestoreThenMarkAbortedSafe,
+    RestoreMetadataThenCommit,
+    RestoreMetadataThenMarkAbortedSafeWithoutContentWrite,
+    RestoreContentAndMetadataThenMarkAbortedSafe,
     BlockForManualRecovery
 }
 
@@ -16,12 +16,13 @@ public static class RecoveryPolicy
     {
         TransactionState.Empty or TransactionState.Committed or TransactionState.AbortedSafe or TransactionState.RollbackSucceeded
             => RecoveryAction.NoAction,
-        TransactionState.TargetVerified when targetMatchesOriginalHash => RecoveryAction.CommitVerified,
-        TransactionState.TargetVerified => RecoveryAction.RestoreThenMarkAbortedSafe,
-        TransactionState.Prepared or TransactionState.TargetWritten or TransactionState.RollbackRequired or TransactionState.RecoveryRequired
-            when targetMatchesOriginalHash => RecoveryAction.MarkAbortedSafeWithoutWrite,
-        TransactionState.Prepared or TransactionState.TargetWritten or TransactionState.RollbackRequired or TransactionState.RecoveryRequired
-            => RecoveryAction.RestoreThenMarkAbortedSafe,
+        TransactionState.RecoveryRequired => RecoveryAction.BlockForManualRecovery,
+        TransactionState.TargetVerified when targetMatchesOriginalHash => RecoveryAction.RestoreMetadataThenCommit,
+        TransactionState.TargetVerified => RecoveryAction.RestoreContentAndMetadataThenMarkAbortedSafe,
+        TransactionState.Prepared or TransactionState.TargetWritten or TransactionState.RollbackRequired
+            when targetMatchesOriginalHash => RecoveryAction.RestoreMetadataThenMarkAbortedSafeWithoutContentWrite,
+        TransactionState.Prepared or TransactionState.TargetWritten or TransactionState.RollbackRequired
+            => RecoveryAction.RestoreContentAndMetadataThenMarkAbortedSafe,
         _ => RecoveryAction.BlockForManualRecovery
     };
 }

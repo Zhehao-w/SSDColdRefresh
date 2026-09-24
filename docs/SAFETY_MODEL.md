@@ -8,9 +8,10 @@
 4. Before the write-attempt boundary, failure/cancellation never rewrites unchanged target content and reconciles to `AbortedSafe`. Once the write call is attempted, partial modification is assumed and failure invokes rollback from verified recovery bytes. A failed rollback preserves the journal and reports `RecoveryRequired`.
 5. Cancellation is honored through journal preparation and immediately before the write-attempt boundary; after it, cancellation is deferred to a safe terminal state.
 6. The locked handle's volume serial, opaque 16-byte `FILE_ID_128`, and size must remain consistent. Paths cannot authorize recovery and the file ID has no GUID semantics.
-7. Original `FILE_BASIC_INFO` timestamps and attributes are part of every prepared journal header, so a fresh recovery process can restore filesystem-visible metadata.
-8. `Committed` requires durable `TargetVerified` evidence. Merely matching original content yields `AbortedSafe`, never refresh success or a `LastRefreshTime` update.
-9. Every transition consumes the latest authoritative record returned by the preceding publication. Any safety-critical anomaly stops the session; it never advances to another file.
+7. Original `FILE_BASIC_INFO` timestamps and attributes are part of every prepared journal header, so a fresh recovery process can restore filesystem-visible metadata. `Committed`, `AbortedSafe`, and `RollbackSucceeded` cannot be published until all five fields are restored, queried back, and verified; `TargetVerified` proves content only.
+8. `Committed` requires durable `TargetVerified` evidence followed by verified metadata restoration. Merely matching original content can proceed toward `AbortedSafe` only after metadata verification; it never proves refresh success or permits a `LastRefreshTime` update.
+9. `RecoveryRequired` is never automatically downgraded based on content equality. It blocks for manual recovery in v1 because unresolved obligations can extend beyond content bytes.
+10. Every transition consumes the latest authoritative record returned by the preceding publication. Any safety-critical anomaly stops the session; it never advances to another file.
 
 ## Protected failure classes
 
@@ -26,4 +27,4 @@ Assumptions are Windows 11 x64, healthy NTFS, correct Win32 identity/locking sem
 
 ## Eligibility
 
-Reject non-NTFS, zero-length, system-protected, pagefile/hiberfil, reparse/symlink/junction, sparse, compressed, encrypted, offline/cloud-placeholder, sharing-violating, identity-ambiguous, or metadata-ambiguous files. `LastWriteTime` (default 365 days) is the primary age signal; `LastAccessTime` is not. Future SQLite `LastRefreshTime` supplements selection but cannot authorize recovery.
+Reject non-NTFS, zero-length, read-only, system-protected, pagefile/hiberfil, reparse/symlink/junction, sparse, compressed, encrypted, offline/cloud-placeholder, sharing-violating, identity-ambiguous, or metadata-ambiguous files. V1 never temporarily clears `FILE_ATTRIBUTE_READONLY`. `LastWriteTime` (default 365 days) is the primary age signal; `LastAccessTime` is not. Future SQLite `LastRefreshTime` supplements selection but cannot authorize recovery.
