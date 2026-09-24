@@ -1,0 +1,35 @@
+# Architecture
+
+## Status and boundaries
+
+This first milestone is deliberately non-destructive. `ColdRefresh.Core` contains platform-neutral policy, immutable identities, the explicit chunk state machine, and a coordinator expressed entirely through testable ports. `ColdRefresh.Windows` is the future Win32 boundary and currently exposes source-generated declarations and constants, but no production refresh adapter. `ColdRefresh.App` is a minimal unpackaged WinUI 3 shell. SQLite is reserved for history and never participates in active recovery.
+
+## Layers
+
+- **Core** owns safety decisions. `ChunkRefreshTransaction` is the only orchestration path. `IChunkSource`, `IRecoveryJournal`, and `IFaultInjector` make every durability boundary observable and injectable. Core never opens a path. Every journal publication returns a new authoritative record; that exact sequence/state pair is the sole input to the next publication.
+- **Windows** will open a single handle with read/write access and sharing that allows reads but denies write/delete, query `FileIdInfo` and `FILE_BASIC_INFO`, reject unsafe attributes and non-NTFS volumes, use `RandomAccess` at explicit offsets, and call `FlushFileBuffers`. Volume disk extents will compare physical disk numbers rather than drive letters.
+- **App** will gate all commands on startup journal reconciliation and expose conservative settings. It will use CommunityToolkit.Mvvm and SQLite history after the destructive boundary is proven.
+
+## Planned refresh pipeline
+
+Scan without following reparse points; reject unsupported files (including `FILE_ATTRIBUTE_READONLY`); open and lock one handle; capture identity, size, and `FILE_BASIC_INFO`; revalidate identity; optionally hash the entire file; process one 64 MiB chunk at a time; restore metadata; revalidate identity and size; hash the entire file again; record history only after success. Read-only is not temporarily cleared/restored in v1. A path is merely a discovery hint. `(volume serial, opaque FILE_ID_128 bytes)` is identity and hard-link deduplication key. The file ID is never interpreted as a GUID.
+
+Cancellation is observed throughout source read and journal preparation and once more immediately before the write-attempt boundary. The boundary is set immediately before calling target write. No cancellation token is forwarded into the target write/flush/verify/rollback critical region. Cancellation before that boundary is classified as safe cancellation; afterwards it is deferred.
+
+## State machine
+
+Normal transitions are `Empty -> Preparing -> Prepared -> TargetWritten -> TargetVerified -> Committed`. `Preparing` is an in-memory state only: an incomplete data write is not recovery truth. Before a target write is attempted, a prepared transaction verifies that content is unchanged, restores/verifies metadata, and becomes `AbortedSafe` without rewriting content. Once a write is attempted, partial modification is assumed and failures enter rollback. Verified content plus restored/verified metadata yields `RollbackSucceeded` and stops the session as suspect. Failed or indeterminate rollback yields `RecoveryRequired`; the journal is retained. Illegal or stale-record transitions fail closed.
+
+Startup must resolve the highest valid dual header before enabling Scan or Refresh, validate payload/identity/size, and read/hash the current chunk without writing. `RecoveryRequired` always blocks for manual recovery. Matching content in `Prepared`, `TargetWritten`, or `RollbackRequired` avoids a content write and proceeds through metadata reconciliation to `AbortedSafe`. Matching `TargetVerified` proceeds through metadata reconciliation to `Committed`. Any non-terminal state whose current content differs from the journal original blocks for manual recovery: after process/OS termination the original lock is gone, so identity and size cannot distinguish an interrupted write from a legitimate post-crash edit.
+
+`Committed`, `AbortedSafe`, and `RollbackSucceeded` are terminal states. The required ordering for all three is: reach a verified-safe content state, restore original CreationTime/LastAccessTime/LastWriteTime/ChangeTime/FileAttributes, query those values through the same locked handle, verify them, and only then publish the terminal header. `TargetVerified` proves content only. A crash or failure before metadata verification leaves the preceding non-terminal journal state authoritative.
+
+Runtime rollback and startup reconciliation are intentionally different. While the original process holds the same validated handle with write/delete sharing denied, a failed attempted write may be automatically rolled back from verified journal bytes. Once authoritative `TargetVerified` is published, content rollback is forbidden; later metadata or journal failures preserve that state without another content write. After restart no original lock exists, so reconciliation is read-only unless content already matches; a mismatch is ambiguous and must never be overwritten automatically.
+
+The fixed journal slot is reusable across chunks. Sequence numbers belong to the journal, increase globally across transactions, and never restart at zero. Core asks the journal to publish a new `Prepared`; it never invents the prior sequence. A new transaction is allowed only after no authority or `Empty`, `Committed`, `AbortedSafe`, or `RollbackSucceeded`. The previous terminal header stays authoritative while the next payload is written/flushed/verified, so a crash before the new `Prepared` creates no recovery obligation.
+
+Slot mutability is enforced inside the journal, not merely by its callers. With no authority or terminal authority the payload may be replaced/retried. As soon as `Prepared` is authoritative, the payload is protected until a safe terminal state. An attempted write under `Prepared`, `TargetWritten`, `TargetVerified`, `RollbackRequired`, or `RecoveryRequired` is rejected before changing bytes, length, pending descriptor, or allocation. Checking only when publishing the next header is too late because it would destroy the current recovery copy.
+
+## Deferred work
+
+Binary journal I/O, real `SafeFileHandle` adapters, device extent discovery, NTFS screening, metadata restoration, startup recovery, sleep inhibition, full-file hashing, and SQLite history are intentionally deferred. No placeholder claims production safety.

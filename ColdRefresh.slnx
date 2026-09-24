@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ColdRefresh.Core/ColdRefresh.Core.csproj" />
+    <Project Path="src/ColdRefresh.Windows/ColdRefresh.Windows.csproj" />
+    <Project Path="src/ColdRefresh.App/ColdRefresh.App.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ColdRefresh.Core.Tests/ColdRefresh.Core.Tests.csproj" />
+    <Project Path="tests/ColdRefresh.Windows.Tests/ColdRefresh.Windows.Tests.csproj" />
+  </Folder>
+</Solution>
