@@ -9,5 +9,6 @@ public enum TransactionState : uint
     Committed = 4,
     RollbackRequired = 5,
     RollbackSucceeded = 6,
-    RecoveryRequired = 7
+    RecoveryRequired = 7,
+    AbortedSafe = 8
 }

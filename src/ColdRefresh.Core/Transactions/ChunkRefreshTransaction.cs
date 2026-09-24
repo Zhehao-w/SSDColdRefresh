@@ -17,7 +17,8 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
 
         var rented = ArrayPool<byte>.Shared.Rent(chunk.Length);
         var verify = ArrayPool<byte>.Shared.Rent(chunk.Length);
-        JournalRecord? prepared = null;
+        JournalRecord? current = null;
+        var targetWriteAttempted = false;
         try
         {
             var original = rented.AsMemory(0, chunk.Length);
@@ -36,16 +37,20 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
                 throw new InvalidDataException("Recovery journal read-back hash mismatch.");
 
             var candidate = new JournalRecord(0, TransactionState.Empty, chunk, sourceHash, journalHash);
-            prepared = await journal.PublishStateAsync(candidate, TransactionState.Prepared);
-            if (prepared.State != TransactionState.Prepared || !prepared.HasValidHashes)
+            current = await journal.PublishStateAsync(candidate, TransactionState.Prepared);
+            if (current.State != TransactionState.Prepared || current.SequenceNumber != candidate.SequenceNumber + 1 || !current.HasValidHashes)
                 throw new InvalidDataException("Journal did not publish a verified PREPARED record.");
             await _faults.AtAsync(FaultPoint.AfterPrepared);
 
-            // Cancellation is intentionally not observed beyond this destructive boundary.
-            await _faults.AtAsync(FaultPoint.DuringTargetWrite);
+            cancellationToken.ThrowIfCancellationRequested();
+            await _faults.AtAsync(FaultPoint.BeforeTargetWriteAttempt);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // The flag moves immediately before the call. From here cancellation is deliberately deferred.
+            targetWriteAttempted = true;
             await target.WriteExactlyAsync(chunk, original);
             await _faults.AtAsync(FaultPoint.AfterTargetWrite);
-            await PublishAsync(prepared, TransactionState.TargetWritten);
+            current = await PublishAsync(current, TransactionState.TargetWritten);
             await _faults.AtAsync(FaultPoint.BeforeTargetFlush);
             await target.FlushAsync();
             await _faults.AtAsync(FaultPoint.AfterTargetFlush);
@@ -55,17 +60,25 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
             if (!CryptographicOperations.FixedTimeEquals(sourceHash, targetHash))
                 throw new InvalidDataException("Target read-back hash mismatch.");
             await _faults.AtAsync(FaultPoint.AfterTargetVerification);
-            var verified = await PublishAsync(prepared, TransactionState.TargetVerified);
-            await PublishAsync(verified, TransactionState.Committed);
+            current = await PublishAsync(current, TransactionState.TargetVerified);
+            current = await PublishAsync(current, TransactionState.Committed);
             return new(TransactionOutcome.Committed);
         }
-        catch (Exception ex) when (prepared is null)
+        catch (OperationCanceledException ex) when (!targetWriteAttempted && cancellationToken.IsCancellationRequested)
+        {
+            return current is null
+                ? new(TransactionOutcome.CancelledAtSafeBoundary, ex)
+                : await AbortSafelyAsync(chunk, current, verify.AsMemory(0, chunk.Length), TransactionOutcome.CancelledAtSafeBoundary, ex);
+        }
+        catch (Exception ex) when (current is null)
         {
             return new(TransactionOutcome.FailedBeforeTargetWrite, ex);
         }
         catch (Exception ex)
         {
-            return await RollbackAsync(chunk, prepared!, rented.AsMemory(0, chunk.Length), verify.AsMemory(0, chunk.Length), ex);
+            return targetWriteAttempted
+                ? await RollbackAsync(chunk, current!, rented.AsMemory(0, chunk.Length), verify.AsMemory(0, chunk.Length), ex)
+                : await AbortSafelyAsync(chunk, current!, verify.AsMemory(0, chunk.Length), TransactionOutcome.AbortedSafe, ex);
         }
         finally
         {
@@ -76,22 +89,51 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
         }
     }
 
-    private async ValueTask<JournalRecord> PublishAsync(JournalRecord record, TransactionState state)
+    private async ValueTask<JournalRecord> PublishAsync(JournalRecord current, TransactionState state)
     {
         await _faults.AtAsync(FaultPoint.DuringStateUpdate);
-        var published = await journal.PublishStateAsync(record, state);
-        if (published.State != state) throw new InvalidDataException($"Journal failed to publish {state}.");
+        var published = await journal.PublishStateAsync(current, state);
+        if (published.State != state || published.SequenceNumber != current.SequenceNumber + 1)
+            throw new InvalidDataException($"Journal failed to publish authoritative {state} state.");
         return published;
     }
 
-    private async ValueTask<TransactionResult> RollbackAsync(ChunkDescriptor chunk, JournalRecord prepared, Memory<byte> recovery, Memory<byte> readback, Exception cause)
+    private async ValueTask<TransactionResult> AbortSafelyAsync(
+        ChunkDescriptor chunk,
+        JournalRecord current,
+        Memory<byte> readback,
+        TransactionOutcome outcome,
+        Exception cause)
     {
         try
         {
-            if (!prepared.HasValidHashes) throw new InvalidDataException("Recovery record is not verified.");
-            await PublishAsync(prepared, TransactionState.RollbackRequired);
+            await target.ReadExactlyAsync(chunk, readback, CancellationToken.None);
+            if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(readback.Span), current.OriginalChunkHash))
+                throw new InvalidDataException("Target changed before the write-attempt boundary.");
+            current = await PublishAsync(current, TransactionState.AbortedSafe);
+            return new(outcome, cause);
+        }
+        catch (Exception reconciliationError)
+        {
+            var combined = new AggregateException(cause, reconciliationError);
+            try { await journal.PreserveForRecoveryAsync(current, combined); } catch { /* Never mask recovery-required. */ }
+            return new(TransactionOutcome.RecoveryRequired, combined);
+        }
+    }
+
+    private async ValueTask<TransactionResult> RollbackAsync(
+        ChunkDescriptor chunk,
+        JournalRecord current,
+        Memory<byte> recovery,
+        Memory<byte> readback,
+        Exception cause)
+    {
+        try
+        {
+            if (!current.HasValidHashes) throw new InvalidDataException("Recovery record is not verified.");
+            current = await PublishAsync(current, TransactionState.RollbackRequired);
             await journal.ReadPayloadExactlyAsync(chunk, recovery, CancellationToken.None);
-            if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(recovery.Span), prepared.OriginalChunkHash))
+            if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(recovery.Span), current.OriginalChunkHash))
                 throw new InvalidDataException("Recovery payload no longer matches its verified hash.");
             await _faults.AtAsync(FaultPoint.DuringRollback);
             await target.WriteExactlyAsync(chunk, recovery);
@@ -99,15 +141,15 @@ public sealed class ChunkRefreshTransaction(IChunkSource target, IRecoveryJourna
             await target.FlushAsync();
             await _faults.AtAsync(FaultPoint.BeforeRollbackVerification);
             await target.ReadExactlyAsync(chunk, readback, CancellationToken.None);
-            if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(readback.Span), prepared.OriginalChunkHash))
+            if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(readback.Span), current.OriginalChunkHash))
                 throw new InvalidDataException("Rollback verification failed.");
-            await PublishAsync(prepared, TransactionState.RollbackSucceeded);
+            current = await PublishAsync(current, TransactionState.RollbackSucceeded);
             return new(TransactionOutcome.RollbackSucceeded, cause);
         }
         catch (Exception rollbackError)
         {
             var combined = new AggregateException(cause, rollbackError);
-            try { await journal.PreserveForRecoveryAsync(prepared, combined); } catch { /* Never mask recovery-required. */ }
+            try { await journal.PreserveForRecoveryAsync(current, combined); } catch { /* Never mask recovery-required. */ }
             return new(TransactionOutcome.RecoveryRequired, combined);
         }
     }

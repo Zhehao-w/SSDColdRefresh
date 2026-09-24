@@ -10,3 +10,5 @@ These rules apply to the entire repository and are non-negotiable.
 6. Use SHA-256 for safety decisions. Optimizations must not weaken recoverability, determinism, verification, or testability.
 7. Do not add unsupported v1 features (reparse, sparse, compressed, EFS, cloud/offline, non-NTFS, raw disk, firmware, TRIM, BitLocker-specific, encryption, or automatic repair).
 8. Production filesystem writes remain disabled until the journal implementation, startup recovery, identity locking, metadata preservation, and fault-injection tests have been reviewed.
+9. Treat `FILE_ID_128` as 16 opaque bytes, never as a GUID. Carry the exact authoritative journal record returned by each state publication into the next transition.
+10. `Committed` requires durable `TargetVerified` evidence. Content that is merely known safe after an uncertain transaction is `AbortedSafe` and must not update `LastRefreshTime`.

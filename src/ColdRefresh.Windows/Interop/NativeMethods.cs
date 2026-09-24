@@ -40,3 +40,27 @@ internal static partial class NativeMethods
         out uint bytesReturned,
         nint overlapped);
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FileId128Native
+{
+    // Opaque bytes. Copy directly into Core FileId128; never marshal through Guid.
+    internal fixed byte Identifier[16];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FileIdInfoNative
+{
+    internal ulong VolumeSerialNumber;
+    internal FileId128Native FileId;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FileBasicInfoNative
+{
+    internal long CreationTime;
+    internal long LastAccessTime;
+    internal long LastWriteTime;
+    internal long ChangeTime;
+    internal uint FileAttributes;
+}

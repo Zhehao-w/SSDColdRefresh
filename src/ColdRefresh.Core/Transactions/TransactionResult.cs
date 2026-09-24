@@ -5,6 +5,7 @@ public enum TransactionOutcome
     Committed,
     CancelledAtSafeBoundary,
     FailedBeforeTargetWrite,
+    AbortedSafe,
     RollbackSucceeded,
     RecoveryRequired
 }

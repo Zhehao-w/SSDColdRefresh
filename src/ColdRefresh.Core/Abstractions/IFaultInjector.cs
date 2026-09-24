@@ -11,7 +11,7 @@ public enum FaultPoint
     AfterJournalWrite,
     BeforeJournalVerification,
     AfterPrepared,
-    DuringTargetWrite,
+    BeforeTargetWriteAttempt,
     AfterTargetWrite,
     BeforeTargetFlush,
     AfterTargetFlush,
